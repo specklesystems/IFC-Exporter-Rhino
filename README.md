@@ -72,35 +72,6 @@ utils/
 
 ## Getting Started
 
-### Prerequisites
-- Python 3.11+
-- A Speckle account and project
-
-### Setup
-```bash
-python -m venv .venv
-# Windows
-.venv\Scripts\activate
-# macOS/Linux
-source .venv/bin/activate
-
-pip install --upgrade pip
-pip install .[dev]
-```
-
-### Running Locally
-Register and run via [Speckle Automate](https://automate.speckle.dev/), or test locally with Docker:
-
-```bash
-docker build -f ./Dockerfile -t ifc-exporter-rhino .
-docker run --rm ifc-exporter-rhino python -u main.py run '<automation_context_json>' '<function_inputs_json>' <speckle_token>
-```
-
-### Testing
-```bash
-pytest
-```
-
 ## Using with Speckle Automate
 
 1. Go to the Automations tab in your project
