@@ -2,6 +2,8 @@
 
 A [Speckle Automate](https://automate.speckle.dev/) function that converts Speckle models (from Rhino and other authoring tools) into IFC 4.3 files.
 
+🚫 **BLOCKER:** fIles that are bigger than 100MB are failing to upload because automate uses the /api/streams/:streamId/blobs endpoint (proxied through our server, which has a 100MB request size limit imposed by cloudflare) - we havea ticket to resolve this TBD.
+
 ## How It Works
 
 1. **Receives** a Speckle model version via Speckle Automate.
