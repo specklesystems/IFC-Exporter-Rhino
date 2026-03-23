@@ -1,17 +1,35 @@
-"""This module contains the function's business logic.
+from datetime import datetime
 
-Use the automation_context module to wrap your function in an Automate context helper.
-"""
+import ifcopenshell.api
 
-from pydantic import Field, SecretStr
+from utils.traversal import traverse, print_tree
+from utils.mapper import classify
+from utils.geometry import mesh_to_ifc, get_display_instances, _make_placement
+from utils.instances import (
+    is_instance, is_definition_source, instance_to_ifc, build_definition_map,
+    print_instance_stats, get_definition_object,
+)
+from utils.properties import (
+    get_building_storey, get_element_name, write_all_properties,
+)
+from utils.curves import curve_to_ifc
+from utils.writer import create_ifc_scaffold, StoreyManager
+from utils.type_manager import TypeManager
+from utils.materials import MaterialManager
+
+
+SPATIAL_STRUCTURE_TYPES = {
+    "IfcBuilding", "IfcBuildingStorey",
+    "IfcExternalSpatialElement", "IfcSpatialZone",
+    "IfcGrid", "IfcAnnotation",
+}
+
+from pydantic import Field
 from speckle_automate import (
     AutomateBase,
     AutomationContext,
     execute_automate_function,
 )
-
-from flatten import flatten_base
-
 
 class FunctionInputs(AutomateBase):
     """These are function author-defined values.
@@ -20,77 +38,227 @@ class FunctionInputs(AutomateBase):
     Please use the pydantic model schema to define your inputs:
     https://docs.pydantic.dev/latest/usage/models/
     """
-
-    # An example of how to use secret values.
-    whisper_message: SecretStr = Field(title="This is a secret message")
-    forbidden_speckle_type: str = Field(
-        title="Forbidden speckle type",
-        description=(
-            "If a object has the following speckle_type,"
-            " it will be marked with an error."
-        ),
+    file_name: str = Field(
+        title="File Name",
+        description="The name of the IFC file.",
     )
+    IFC_PROJECT_NAME : str = Field(
+						title="IFC Project Name",
+						description="The name of the IFC project.",
+		)
+    IFC_SITE_NAME : str = Field(
+						title="IFC Site Name",
+						description="The name of the IFC site.",
+		)
+    IFC_BUILDING_NAME : str = Field(
+						title="IFC Building Name",
+						description="The name of the IFC building.",
+		)
 
 
 def automate_function(
     automate_context: AutomationContext,
     function_inputs: FunctionInputs,
 ) -> None:
-    """This is an example Speckle Automate function.
+    print("=" * 60)
+    print("  Speckle -> IFC4.3 Exporter")
+    print("=" * 60)
 
-    Args:
-        automate_context: A context-helper object that carries relevant information
-            about the runtime context of this function.
-            It gives access to the Speckle project data that triggered this run.
-            It also has convenient methods for attaching results to the Speckle model.
-        function_inputs: An instance object matching the defined schema.
-    """
-    # The context provides a convenient way to receive the triggering version.
-    version_root_object = automate_context.receive_version()
+    # ------------------------------------------------------------------ #
+    # 1. Receive
+    # ------------------------------------------------------------------ #
+    base = automate_context.receive_version()
 
-    objects_with_forbidden_speckle_type = [
-        b
-        for b in flatten_base(version_root_object)
-        if b.speckle_type == function_inputs.forbidden_speckle_type
-    ]
-    count = len(objects_with_forbidden_speckle_type)
+    # Uncomment to debug object tree:
+    # print_tree(base)
 
-    if count > 0:
-        # This is how a run is marked with a failure cause.
-        automate_context.attach_error_to_objects(
-            category="Forbidden speckle_type"
-            f" ({function_inputs.forbidden_speckle_type})",
-            affected_objects=objects_with_forbidden_speckle_type,
-            message="This project should not contain the type: "
-            f"{function_inputs.forbidden_speckle_type}",
+    # ------------------------------------------------------------------ #
+    # 2. Build definition map (for instance resolution)
+    # ------------------------------------------------------------------ #
+    definition_map = build_definition_map(base)
+
+    # ------------------------------------------------------------------ #
+    # 3. Set up IFC
+    # ------------------------------------------------------------------ #
+    ifc, _site, building, body_context = create_ifc_scaffold(
+        project_name=function_inputs.IFC_PROJECT_NAME,
+        site_name=function_inputs.IFC_SITE_NAME,
+        building_name=function_inputs.IFC_BUILDING_NAME,
+    )
+    storey_manager = StoreyManager(ifc, building)
+    material_manager = MaterialManager(ifc, base)
+    material_manager.build_definition_material_map(definition_map)
+    type_manager = TypeManager(ifc)
+
+    # ------------------------------------------------------------------ #
+    # 4. Traverse & export
+    # ------------------------------------------------------------------ #
+    total           = 0
+    no_geometry     = 0
+    skipped_spatial = 0
+    instance_count  = 0
+
+    print(f"\nProcessing elements...\n")
+
+    for obj in traverse(base):
+
+        ifc_class = classify(obj)
+
+        if ifc_class in SPATIAL_STRUCTURE_TYPES:
+            skipped_spatial += 1
+            continue
+
+        # Skip objects that serve as instance definition geometry sources
+        if is_definition_source(obj, definition_map):
+            continue
+
+        # Get building storey from properties
+        storey_name = get_building_storey(obj)
+        storey = storey_manager.get_or_create(storey_name)
+
+        # Get element name
+        name = get_element_name(obj)
+
+        # ------------------------------------------------------------------ #
+        # Path A: Instance object (has transform + definitionId)
+        # ------------------------------------------------------------------ #
+        if is_instance(obj):
+            # Try to get a better IFC class from the definition object
+            if ifc_class == "IfcBuildingElementProxy":
+                def_obj = get_definition_object(obj, definition_map)
+                if def_obj:
+                    ifc_class = classify(def_obj)
+
+            rep, placement = instance_to_ifc(
+                ifc, body_context, obj, definition_map,
+                scale=1.0, material_manager=material_manager,
+            )
+            if not rep:
+                no_geometry += 1
+                continue
+            element = _create_element(ifc, ifc_class, name, rep, placement,
+                                      storey, storey_manager=storey_manager)
+            write_all_properties(ifc, element, obj)
+            type_manager.assign(element, obj, ifc_class)
+            instance_count += 1
+            total += 1
+
+        else:
+            # ------------------------------------------------------------------ #
+            # Path B: Normal object — may have:
+            #   B1. Direct mesh geometry in displayValue
+            #   B2. Instance objects in displayValue
+            #   B3. Curve geometry (Polycurve, Line, Arc)
+            # ------------------------------------------------------------------ #
+
+            # B1: Mesh geometry
+            rep, placement = mesh_to_ifc(
+                ifc, body_context, obj, scale=1.0,
+                material_manager=material_manager,
+            )
+            if rep:
+                element = _create_element(ifc, ifc_class, name, rep, placement,
+                                          storey, storey_manager=storey_manager)
+                write_all_properties(ifc, element, obj)
+                type_manager.assign(element, obj, ifc_class)
+                total += 1
+
+            # B2: Instance objects nested inside displayValue
+            nested_instances = get_display_instances(obj)
+            for inst in nested_instances:
+                inst_rep, inst_placement = instance_to_ifc(
+                    ifc, body_context, inst, definition_map,
+                    scale=1.0, material_manager=material_manager,
+                )
+                if not inst_rep:
+                    no_geometry += 1
+                    continue
+                inst_element = _create_element(
+                    ifc, ifc_class, name, inst_rep, inst_placement,
+                    storey, storey_manager=storey_manager,
+                )
+                write_all_properties(ifc, inst_element, obj)
+                type_manager.assign(inst_element, obj, ifc_class)
+                instance_count += 1
+                total += 1
+
+            # B3: Curve geometry (Polycurve, Line, Arc) — fallback if no mesh/instances
+            if not rep and not nested_instances:
+                rep, placement = curve_to_ifc(
+                    ifc, body_context, obj, scale=1.0,
+                    material_manager=material_manager,
+                )
+                if rep:
+                    element = _create_element(ifc, ifc_class, name, rep, placement,
+                                              storey, storey_manager=storey_manager)
+                    write_all_properties(ifc, element, obj)
+                    type_manager.assign(element, obj, ifc_class)
+                    total += 1
+
+            # Track if no path produced geometry
+            if not rep and not nested_instances:
+                no_geometry += 1
+
+        if total % 100 == 0 and total > 0:
+            print(f"  ... processed {total} elements")
+
+    # ------------------------------------------------------------------ #
+    # 5. Write output
+    # ------------------------------------------------------------------ #
+    print("\nFlushing spatial containment...")
+    storey_manager.flush()
+    print("Flushing type relationships...")
+    type_manager.flush()
+
+    file_name = function_inputs.file_name
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    ifc_filename = f"{file_name}_{timestamp}.ifc"
+
+    ifc.write(ifc_filename)
+    print(f"\nIFC file written: {ifc_filename}")
+    # try:
+    #     automate_context.mark_run_success("Success! You can download the IF file below.")
+    #     automate_context.store_file_result(f"./{ifc_filename}")
+    # except Exception as e:
+    #     print(f"  ⚠️  Could not upload file result (network issue?): {e}")
+    #     automate_context.mark_run_failed(f"Something went wrong when storing file result. Exception detail: {e}") 
+
+    print(f"\n{'=' * 60}")
+    print(f"  Export complete!")
+    print(f"  Total exported     : {total}")
+    print(f"  Instances          : {instance_count}")
+    print(f"  Without geometry   : {no_geometry}")
+    print(f"  Skipped (spatial)  : {skipped_spatial}")
+    print(f"  Storeys created    : {storey_manager.count}")
+    print(f"  Levels             : {', '.join(storey_manager.names)}")
+    print_instance_stats()
+    material_manager.print_stats()
+    print(f"{'=' * 60}\n")
+
+def _create_element(ifc, ifc_class, name, rep, placement, storey,
+                    storey_manager=None):
+    """Helper: create an IFC element, assign geometry + placement, queue containment."""
+    element = ifcopenshell.api.run("root.create_entity", ifc,
+                                   ifc_class=ifc_class, name=str(name))
+
+    if rep and placement:
+        element.Representation = ifc.createIfcProductDefinitionShape(
+            Representations=(rep,)
         )
-        automate_context.mark_run_failed(
-            "Automation failed: "
-            f"Found {count} object that have one of the forbidden speckle types: "
-            f"{function_inputs.forbidden_speckle_type}"
-        )
-
-        # Set the automation context view to the original model/version view
-        # to show the offending objects.
-        automate_context.set_context_view()
-
+        element.ObjectPlacement = placement
+    elif placement:
+        element.ObjectPlacement = placement
     else:
-        automate_context.mark_run_success("No forbidden types found.")
+        element.ObjectPlacement = _make_placement(ifc, 0.0, 0.0, 0.0)
 
-    # If the function generates file results, this is how it can be
-    # attached to the Speckle project/model
-    # automate_context.store_file_result("./report.pdf")
-
-
-def automate_function_without_inputs(automate_context: AutomationContext) -> None:
-    """A function example without inputs.
-
-    If your function does not need any input variables,
-     besides what the automation context provides,
-     the inputs argument can be omitted.
-    """
-    pass
-
+    # Queue spatial assignment (batched flush at end for performance)
+    if storey_manager:
+        if ifc_class in ("IfcSite", "IfcSpace"):
+            storey_manager.queue_aggregate(storey, element)
+        else:
+            storey_manager.queue_contain(storey, element)
+    return element
 
 # make sure to call the function with the executor
 if __name__ == "__main__":

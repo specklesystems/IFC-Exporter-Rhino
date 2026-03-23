@@ -1,174 +1,117 @@
-# Speckle Automate function template - Python
+# Speckle → IFC 4.3 Exporter (Rhino)
 
-This template repository is for a Speckle Automate function written in Python
-using the [specklepy](https://pypi.org/project/specklepy/) SDK to interact with Speckle data.
+A [Speckle Automate](https://automate.speckle.dev/) function that converts Speckle models (from Rhino and other authoring tools) into IFC 4.3 files.
 
-This template contains the full scaffolding required to publish a function to the Automate environment.
-It also has some sane defaults for development environment setups.
+## How It Works
 
-## Getting started
+1. **Receives** a Speckle model version via Speckle Automate.
+2. **Traverses** the nested Collection tree to find all BIM elements.
+3. **Classifies** each element into its IFC type (e.g. `IfcColumn`, `IfcWall`) using the `Attributes.type` property.
+4. **Exports geometry** — meshes, instances (block definitions), and curves — into IFC representations.
+5. **Clones properties** — attributes, property sets, and quantities — from the Speckle object onto the IFC entity.
+6. **Writes** the resulting `.ifc` file.
 
-1. Use this template repository to create a new repository in your own / organization's profile.
-1. Register the function
+## Supported Property Formats
 
-### Add new dependencies
+The exporter handles two property formats:
 
-To add new Python package dependencies to the project, edit the `pyproject.toml` file:
-
-**For packages your function needs to run** (like pandas, requests, etc.):
-```toml
-dependencies = [
-    "specklepy==3.0.0",
-    "pandas==2.1.0",  # Add production dependencies here
-]
+### Nested (ArchiCAD / IFC-native)
+Properties are stored as nested dicts under `_properties`:
+```
+_properties:
+  Attributes:
+    Name: "MyColumn"
+    type: "IfcColumn"
+  Property Sets:
+    Pset_ColumnCommon:
+      IsExternal: true
+  Quantities:
+    BaseQuantities:
+      Height: {name: "Height", units: "millimetre", value: 3000}
 ```
 
-**For development tools** (like testing or formatting tools):
-```toml
-[project.optional-dependencies]
-dev = [
-    "black==23.12.1",
-    "pytest-mock==3.11.1",  # Add development dependencies here
-    # ... other dev tools
-]
+### Flat Dot-Notation (Rhino / Speckle)
+Properties are stored as flat key-value pairs with dot-separated paths under `properties`:
+```
+properties:
+  Attributes.Name: "600S162-43-50"
+  Attributes.type: "IfcColumn"
+  Attributes.GlobalId: "yOTS1rnOhBKW4JIfec29TS"
+  Quantities.BaseQuantities.Gross Weight.value: "15.452"
+  Quantities.BaseQuantities.Member Length.value: "118.938"
 ```
 
-**How to decide which section?**
-- If your `main.py` (or other function logic) imports it → `dependencies`
-- If it's just a tool to help you code → `[project.optional-dependencies].dev`
+The exporter automatically detects the format and unflattens dot-notation keys into the nested structure before processing.
 
-Example:
-```python
-# In your main.py
-import pandas as pd  # ← This goes in dependencies
-import specklepy     # ← This goes in dependencies
+## Function Inputs
 
-# You won't import these in main.py:
-# pytest, black, mypy ← These go in [project.optional-dependencies].dev
+| Input | Description |
+|---|---|
+| `file_name` | Output IFC filename (timestamp is appended) |
+| `IFC_PROJECT_NAME` | Name for the IfcProject entity |
+| `IFC_SITE_NAME` | Name for the IfcSite entity |
+| `IFC_BUILDING_NAME` | Name for the IfcBuilding entity |
+
+## Project Structure
+
+```
+main.py                 # Automate entry point — traversal, export loop, IFC writing
+utils/
+  traversal.py          # Walks the Speckle Collection tree
+  mapper.py             # Maps Speckle objects → IFC entity classes
+  properties.py         # Extracts & writes attributes, property sets, quantities
+  geometry.py           # Mesh → IFC geometry conversion
+  instances.py          # Block instance / definition handling
+  curves.py             # Curve geometry (Polycurve, Line, Arc)
+  writer.py             # IFC scaffold creation, storey management
+  type_manager.py       # IfcTypeObject creation & assignment
+  materials.py          # Material mapping
+  helpers.py            # Shared utilities (_get, unit scales)
+  receiver.py           # Speckle server connection & data retrieval
 ```
 
-### Change launch variables
+## Getting Started
 
-Describe how the launch.json should be edited.
+### Prerequisites
+- Python 3.11+
+- A Speckle account and project
 
-### GitHub Codespaces
-
-Create a new repo from this template, and use the create new code.
-
-### Using this Speckle Function
-
-1. [Create](https://automate.speckle.dev/) a new Speckle Automation.
-1. Select your Speckle Project and Speckle Model.
-1. Select the deployed Speckle Function.
-1. Enter a phrase to use in the comment.
-1. Click `Create Automation`.
-
-## Getting Started with Creating Your Own Speckle Function
-
-1. [Register](https://automate.speckle.dev/) your Function with [Speckle Automate](https://automate.speckle.dev/) and select the Python template.
-1. A new repository will be created in your GitHub account.
-1. Make changes to your Function in `main.py`. See below for the Developer Requirements and instructions on how to test.
-1. To create a new version of your Function, create a new [GitHub release](https://docs.github.com/en/repositories/releasing-projects-on-github/managing-releases-in-a-repository) in your repository.
-
-## Developer Requirements
-
-1. Install the following:
-    - [Python 3.11+](https://www.python.org/downloads/)
-1. Run the following to set up your development environment:
-    ```bash
-    python -m venv .venv
-    # On Windows
-    .venv\Scripts\activate
-    # On macOS/Linux
-    source .venv/bin/activate
-
-    pip install --upgrade pip
-    pip install .[dev]
-    ```
-
-**What this installs:**
-- All the packages your function needs to run (`dependencies`)
-- Plus development tools like testing and code formatting (`[project.optional-dependencies].dev`)
-
-**Why separate sections?**
-- `dependencies`: Only what gets deployed with your function (lightweight)
-- `dev` dependencies: Extra tools to help you write better code locally
-
-## Building and Testing
-
-The code can be tested locally by running `pytest`.
-
-### Alternative dependency managers
-
-This template uses the modern **PEP 621** standard in `pyproject.toml`, which works with all modern Python dependency managers:
-
-#### Using Poetry
+### Setup
 ```bash
-poetry install  # Automatically reads pyproject.toml
+python -m venv .venv
+# Windows
+.venv\Scripts\activate
+# macOS/Linux
+source .venv/bin/activate
+
+pip install --upgrade pip
+pip install .[dev]
 ```
 
-#### Using uv
+### Running Locally
+Register and run via [Speckle Automate](https://automate.speckle.dev/), or test locally with Docker:
+
 ```bash
-uv sync  # Automatically reads pyproject.toml
+docker build -f ./Dockerfile -t ifc-exporter-rhino .
+docker run --rm ifc-exporter-rhino python -u main.py run '<automation_context_json>' '<function_inputs_json>' <speckle_token>
 ```
 
-#### Using pip-tools
+### Testing
 ```bash
-pip-compile pyproject.toml  # Generate requirements.txt from pyproject.toml
-pip install -r requirements.txt
+pytest
 ```
 
-#### Using pdm
-```bash
-pdm install  # Automatically reads pyproject.toml
-```
+## Using with Speckle Automate
 
-**Advantage**: All tools read the same `pyproject.toml` file, so there's no need to keep multiple files in sync!
-
-### Building and running the Docker Container Image
-
-Running and testing your code on your machine is a great way to develop your Function; the following instructions are a bit more in-depth and only required if you are having issues with your Function in GitHub Actions or on Speckle Automate.
-
-#### Building the Docker Container Image
-
-The GitHub Action packages your code into the format required by Speckle Automate. This is done by building a Docker Image, which Speckle Automate runs. You can attempt to build the Docker Image locally to test the building process.
-
-To build the Docker Container Image, you must have [Docker](https://docs.docker.com/get-docker/) installed.
-
-Once you have Docker running on your local machine:
-
-1. Open a terminal
-1. Navigate to the directory in which you cloned this repository
-1. Run the following command:
-
-    ```bash
-    docker build -f ./Dockerfile -t speckle_automate_python_example .
-    ```
-
-#### Running the Docker Container Image
-
-Once the GitHub Action has built the image, it is sent to Speckle Automate. When Speckle Automate runs your Function as part of an Automation, it will run the Docker Container Image. You can test that your Docker Container Image runs correctly locally.
-
-1. To then run the Docker Container Image, run the following command:
-
-    ```bash
-    docker run --rm speckle_automate_python_example \
-    python -u main.py run \
-    '{"projectId": "1234", "modelId": "1234", "branchName": "myBranch", "versionId": "1234", "speckleServerUrl": "https://speckle.xyz", "automationId": "1234", "automationRevisionId": "1234", "automationRunId": "1234", "functionId": "1234", "functionName": "my function", "functionLogo": "base64EncodedPng"}' \
-    '{}' \
-    yourSpeckleServerAuthenticationToken
-    ```
-
-Let's explain this in more detail:
-
-`docker run—-rm speckle_automate_python_example` tells Docker to run the Docker Container Image we built earlier. `speckle_automate_python_example` is the name of the Docker Container Image. The `--rm` flag tells Docker to remove the container after it has finished running, freeing up space on your machine.
-
-The line `python -u main.py run` is the command run inside the Docker Container Image. The rest of the command is the arguments passed to the command. The arguments are:
-
-- `'{"projectId": "1234", "modelId": "1234", "branchName": "myBranch", "versionId": "1234", "speckleServerUrl": "https://speckle.xyz", "automationId": "1234", "automationRevisionId": "1234", "automationRunId": "1234", "functionId": "1234", "functionName": "my function", "functionLogo": "base64EncodedPng"}'` - the metadata that describes the automation and the function.
-- `{}` - the input parameters for the function the Automation creator can set. Here, they are blank, but you can add your parameters to test your function.
-- `yourSpeckleServerAuthenticationToken`—the authentication token for the Speckle Server that the Automation can connect to. This is required to interact with the Speckle Server, for example, to get data from the Model.
+1. Go to the Automations tab in your project
+2. Click New Automation
+3. Select your function from the library
+4. Configure function inputs and parameters
+5. Choose a Speckle model to trigger the automation
+6. Name your automation and click Create
 
 ## Resources
 
-- [Learn](https://speckle.guide/dev/python.html) more about SpecklePy and interacting with Speckle from Python.
+- [SpecklePy SDK](https://speckle.guide/dev/python.html)
+- [Speckle Automate](https://docs.speckle.systems/developers/automate/introduction)
+- [IFC 4.3 Documentation](https://standards.buildingsmart.org/IFC/RELEASE/IFC4_3/)
