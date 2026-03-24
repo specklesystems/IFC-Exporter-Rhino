@@ -13,6 +13,7 @@
 
 import ifcopenshell
 import ifcopenshell.api
+import ifcopenshell.guid
 from specklepy.objects.base import Base
 from utils.helpers import _get
 
@@ -121,17 +122,34 @@ def get_element_name(obj) -> str:
 # IFC value creation
 # ---------------------------------------------------------------------------
 
+_ifc_value_cache: dict[int, dict] = {}
+
+
 def _make_ifc_value(ifc, value):
-    """Create an IFC nominal value entity from a Python value, detecting type."""
+    """Create a cached IFC nominal value entity from a Python value, detecting type.
+
+    Identical values reuse the same IFC entity to reduce file size.
+    """
+    fid = id(ifc)
+    if fid not in _ifc_value_cache:
+        _ifc_value_cache[fid] = {}
+    cache = _ifc_value_cache[fid]
+
     if isinstance(value, bool):
-        return ifc.create_entity("IfcBoolean", wrappedValue=value)
-    if isinstance(value, int):
-        return ifc.create_entity("IfcInteger", wrappedValue=value)
-    if isinstance(value, float):
-        return ifc.create_entity("IfcReal", wrappedValue=value)
-    if isinstance(value, list):
-        return ifc.create_entity("IfcLabel", wrappedValue=", ".join(str(v) for v in value))
-    return ifc.create_entity("IfcLabel", wrappedValue=str(value))
+        cache_key = ("IfcBoolean", value)
+    elif isinstance(value, int):
+        cache_key = ("IfcInteger", value)
+    elif isinstance(value, float):
+        cache_key = ("IfcReal", value)
+    elif isinstance(value, list):
+        cache_key = ("IfcLabel", ", ".join(str(v) for v in value))
+    else:
+        cache_key = ("IfcLabel", str(value))
+
+    if cache_key not in cache:
+        entity_type, wrapped = cache_key
+        cache[cache_key] = ifc.create_entity(entity_type, wrappedValue=wrapped)
+    return cache[cache_key]
 
 
 # ---------------------------------------------------------------------------
@@ -202,50 +220,7 @@ def set_element_attributes(ifc, element, obj):
 
 
 # ---------------------------------------------------------------------------
-# Write property sets from _properties.Property Sets
-# ---------------------------------------------------------------------------
-
-def write_property_sets(ifc, element, obj):
-    """Write all property sets from _properties.Property Sets."""
-    props = get_properties(obj)
-    properties_section = _to_dict(props.get("Property Sets"))
-    if not properties_section:
-        return
-
-    for pset_name, pset_data in properties_section.items():
-        pset_dict = _to_dict(pset_data) if not isinstance(pset_data, dict) else pset_data
-        if not pset_dict:
-            continue
-
-        ifc_props = []
-        for prop_name, prop_value in pset_dict.items():
-            if prop_name == "id":
-                continue
-            if prop_value is None:
-                continue
-            try:
-                nominal = _make_ifc_value(ifc, prop_value)
-                p = ifc.create_entity(
-                    "IfcPropertySingleValue",
-                    Name=str(prop_name),
-                    NominalValue=nominal,
-                )
-                ifc_props.append(p)
-            except Exception:
-                continue
-
-        if ifc_props:
-            try:
-                pset = ifcopenshell.api.run(
-                    "pset.add_pset", ifc, product=element, name=pset_name
-                )
-                pset.HasProperties = ifc_props
-            except Exception as e:
-                print(f"  Warning: {pset_name}: {e}")
-
-
-# ---------------------------------------------------------------------------
-# Write quantity sets from _properties.Quantities
+# PropertySetManager — shared property sets across elements
 # ---------------------------------------------------------------------------
 
 def _try_float(value):
@@ -260,8 +235,261 @@ def _try_float(value):
     return None
 
 
-def write_quantity_sets(ifc, element, obj):
-    """Write all quantity sets from _properties.Quantities."""
+def _pset_content_key(pset_name: str, items: list) -> str:
+    """Build a hashable key from pset name + sorted property name-value pairs."""
+    return repr((pset_name, sorted(items)))
+
+
+def _qto_content_key(qto_name: str, items: list) -> str:
+    """Build a hashable key from qto name + sorted quantity tuples."""
+    return repr((qto_name, sorted(items)))
+
+
+class PropertySetManager:
+    """Creates shared IfcPropertySet / IfcElementQuantity entities.
+
+    Instead of creating one pset per element, identical psets are created
+    once and linked to all elements that share them via a single
+    IfcRelDefinesByProperties (written at flush time).
+    """
+
+    def __init__(self, ifc: ifcopenshell.file):
+        self._ifc = ifc
+        # content_key → IfcPropertySet / IfcElementQuantity entity
+        self._pset_cache: dict[str, object] = {}
+        # pset entity id → [element, ...]
+        self._pending: dict[int, list] = {}
+        self._pset_count = 0
+        self._shared_count = 0
+
+    def queue_property_sets(self, element, obj):
+        """Extract Property Sets from obj and queue shared assignment to element."""
+        props = get_properties(obj)
+        properties_section = _to_dict(props.get("Property Sets"))
+        if not properties_section:
+            return
+
+        ifc = self._ifc
+        for pset_name, pset_data in properties_section.items():
+            pset_dict = _to_dict(pset_data) if not isinstance(pset_data, dict) else pset_data
+            if not pset_dict:
+                continue
+
+            # Build content items for hashing (skip id and None values)
+            content_items = []
+            for prop_name, prop_value in pset_dict.items():
+                if prop_name == "id" or prop_value is None:
+                    continue
+                content_items.append((str(prop_name), repr(prop_value)))
+
+            if not content_items:
+                continue
+
+            key = _pset_content_key(pset_name, content_items)
+
+            if key not in self._pset_cache:
+                # Create the shared IfcPropertySet entity
+                ifc_props = []
+                for prop_name, prop_value in pset_dict.items():
+                    if prop_name == "id" or prop_value is None:
+                        continue
+                    try:
+                        nominal = _make_ifc_value(ifc, prop_value)
+                        p = ifc.create_entity(
+                            "IfcPropertySingleValue",
+                            Name=str(prop_name),
+                            NominalValue=nominal,
+                        )
+                        ifc_props.append(p)
+                    except Exception:
+                        continue
+
+                if not ifc_props:
+                    continue
+
+                pset = ifc.create_entity(
+                    "IfcPropertySet",
+                    GlobalId=ifcopenshell.guid.new(),
+                    Name=pset_name,
+                    HasProperties=ifc_props,
+                )
+                self._pset_cache[key] = pset
+                self._pset_count += 1
+            else:
+                self._shared_count += 1
+
+            pset = self._pset_cache[key]
+            pid = pset.id()
+            if pid not in self._pending:
+                self._pending[pid] = []
+            self._pending[pid].append(element)
+
+    def queue_quantity_sets(self, element, obj):
+        """Extract Quantities from obj and queue shared assignment to element."""
+        props = get_properties(obj)
+        quantities_raw = props.get("Quantities")
+        if quantities_raw is None:
+            return
+        quantities_section = _to_dict(quantities_raw)
+        if not quantities_section:
+            return
+
+        ifc = self._ifc
+        for qto_name, qto_data in quantities_section.items():
+            qto_dict = _to_dict(qto_data) if not isinstance(qto_data, dict) else qto_data
+            if not qto_dict:
+                continue
+
+            # Build content items for hashing
+            content_items = []
+            for qty_key, qty_entry in qto_dict.items():
+                if qty_key == "id":
+                    continue
+                if isinstance(qty_entry, dict):
+                    name = qty_entry.get("name", qty_key)
+                    units = (qty_entry.get("units") or "").strip().lower()
+                    value = _try_float(qty_entry.get("value"))
+                else:
+                    value = _try_float(qty_entry)
+                    if value is None:
+                        continue
+                    name = qty_key
+                    units = ""
+                if value is not None:
+                    content_items.append((name, units, value))
+
+            if not content_items:
+                continue
+
+            key = _qto_content_key(qto_name, content_items)
+
+            if key not in self._pset_cache:
+                quantities = []
+                for qty_key, qty_entry in qto_dict.items():
+                    if qty_key == "id":
+                        continue
+                    if isinstance(qty_entry, dict):
+                        name = qty_entry.get("name", qty_key)
+                        units = (qty_entry.get("units") or "").strip().lower()
+                        value = _try_float(qty_entry.get("value"))
+                    else:
+                        value = _try_float(qty_entry)
+                        if value is None:
+                            continue
+                        name = qty_key
+                        units = ""
+                    if value is None:
+                        continue
+
+                    try:
+                        mapping = _UNIT_QTY_MAP.get(units)
+                        if not mapping:
+                            name_lower = name.lower()
+                            for keyword, m in _NAME_QTY_MAP.items():
+                                if keyword in name_lower:
+                                    mapping = m
+                                    break
+                        if mapping:
+                            qty_type, value_attr = mapping
+                            qty = ifc.create_entity(
+                                qty_type, Name=name, **{value_attr: value}
+                            )
+                        else:
+                            qty = ifc.create_entity(
+                                "IfcQuantityCount", Name=name, CountValue=int(value)
+                            )
+                        quantities.append(qty)
+                    except Exception as e:
+                        print(f"  Warning: quantity {name}: {e}")
+                        continue
+
+                if not quantities:
+                    continue
+
+                qto = ifc.create_entity(
+                    "IfcElementQuantity",
+                    GlobalId=ifcopenshell.guid.new(),
+                    Name=qto_name,
+                    Quantities=quantities,
+                )
+                self._pset_cache[key] = qto
+                self._pset_count += 1
+            else:
+                self._shared_count += 1
+
+            qto = self._pset_cache[key]
+            qid = qto.id()
+            if qid not in self._pending:
+                self._pending[qid] = []
+            self._pending[qid].append(element)
+
+    def flush(self):
+        """Write all batched IfcRelDefinesByProperties relationships."""
+        ifc = self._ifc
+        for pset_id, elements in self._pending.items():
+            pset = ifc.by_id(pset_id)
+            try:
+                ifc.create_entity(
+                    "IfcRelDefinesByProperties",
+                    GlobalId=ifcopenshell.guid.new(),
+                    RelatedObjects=elements,
+                    RelatingPropertyDefinition=pset,
+                )
+            except Exception as e:
+                print(f"  Warning: pset rel: {e}")
+        self._pending.clear()
+
+    def print_stats(self):
+        total = self._pset_count + self._shared_count
+        print(f"  Property sets: {self._pset_count} unique / {total} total ({self._shared_count} shared)")
+
+
+# ---------------------------------------------------------------------------
+# Public API — called from main.py
+# ---------------------------------------------------------------------------
+
+def write_all_properties(ifc, element, obj, property_manager=None):
+    """Write all properties, quantities, and attributes from _properties."""
+    set_element_attributes(ifc, element, obj)
+    if property_manager:
+        property_manager.queue_property_sets(element, obj)
+        property_manager.queue_quantity_sets(element, obj)
+    else:
+        # Fallback: direct per-element creation (no sharing)
+        _write_property_sets_direct(ifc, element, obj)
+        _write_quantity_sets_direct(ifc, element, obj)
+
+
+def _write_property_sets_direct(ifc, element, obj):
+    """Legacy per-element property set writing (fallback)."""
+    props = get_properties(obj)
+    properties_section = _to_dict(props.get("Property Sets"))
+    if not properties_section:
+        return
+    for pset_name, pset_data in properties_section.items():
+        pset_dict = _to_dict(pset_data) if not isinstance(pset_data, dict) else pset_data
+        if not pset_dict:
+            continue
+        ifc_props = []
+        for prop_name, prop_value in pset_dict.items():
+            if prop_name == "id" or prop_value is None:
+                continue
+            try:
+                nominal = _make_ifc_value(ifc, prop_value)
+                p = ifc.create_entity("IfcPropertySingleValue", Name=str(prop_name), NominalValue=nominal)
+                ifc_props.append(p)
+            except Exception:
+                continue
+        if ifc_props:
+            try:
+                pset = ifcopenshell.api.run("pset.add_pset", ifc, product=element, name=pset_name)
+                pset.HasProperties = ifc_props
+            except Exception:
+                pass
+
+
+def _write_quantity_sets_direct(ifc, element, obj):
+    """Legacy per-element quantity set writing (fallback)."""
     props = get_properties(obj)
     quantities_raw = props.get("Quantities")
     if quantities_raw is None:
@@ -269,20 +497,14 @@ def write_quantity_sets(ifc, element, obj):
     quantities_section = _to_dict(quantities_raw)
     if not quantities_section:
         return
-
     for qto_name, qto_data in quantities_section.items():
         qto_dict = _to_dict(qto_data) if not isinstance(qto_data, dict) else qto_data
         if not qto_dict:
             continue
-
         quantities = []
         for qty_key, qty_entry in qto_dict.items():
             if qty_key == "id":
                 continue
-
-            # Quantity entries can be:
-            #   - {name, units, value} dicts (ArchiCAD / IFC-native)
-            #   - plain numbers or numeric strings (Grasshopper)
             if isinstance(qty_entry, dict):
                 name = qty_entry.get("name", qty_key)
                 units = (qty_entry.get("units") or "").strip().lower()
@@ -293,50 +515,26 @@ def write_quantity_sets(ifc, element, obj):
                     continue
                 name = qty_key
                 units = ""
-
             if value is None:
                 continue
-
             try:
                 mapping = _UNIT_QTY_MAP.get(units)
                 if not mapping:
-                    # Infer quantity type from name keywords
-                    name_lower = name.lower()
                     for keyword, m in _NAME_QTY_MAP.items():
-                        if keyword in name_lower:
+                        if keyword in name.lower():
                             mapping = m
                             break
                 if mapping:
                     qty_type, value_attr = mapping
-                    qty = ifc.create_entity(
-                        qty_type, Name=name, **{value_attr: value}
-                    )
+                    qty = ifc.create_entity(qty_type, Name=name, **{value_attr: value})
                 else:
-                    # CountValue requires int
-                    qty = ifc.create_entity(
-                        "IfcQuantityCount", Name=name, CountValue=int(value)
-                    )
+                    qty = ifc.create_entity("IfcQuantityCount", Name=name, CountValue=int(value))
                 quantities.append(qty)
-            except Exception as e:
-                print(f"  Warning: quantity {name}: {e}")
+            except Exception:
                 continue
-
         if quantities:
             try:
-                qto = ifcopenshell.api.run(
-                    "pset.add_qto", ifc, product=element, name=qto_name
-                )
+                qto = ifcopenshell.api.run("pset.add_qto", ifc, product=element, name=qto_name)
                 qto.Quantities = quantities
-            except Exception as e:
-                print(f"  Warning: {qto_name}: {e}")
-
-
-# ---------------------------------------------------------------------------
-# Public API — called from main.py
-# ---------------------------------------------------------------------------
-
-def write_all_properties(ifc, element, obj):
-    """Write all properties, quantities, and attributes from _properties."""
-    set_element_attributes(ifc, element, obj)
-    write_property_sets(ifc, element, obj)
-    write_quantity_sets(ifc, element, obj)
+            except Exception:
+                pass

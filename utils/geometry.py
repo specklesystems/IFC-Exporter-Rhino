@@ -76,6 +76,13 @@ def build_ifc_facesets(ifc, verts_scaled: list, face_groups: list) -> list:
     if not valid_faces or not deduped_verts:
         return []
 
+    # Round vertex coordinates to reduce IFC text file size
+    # 3 decimal places = 0.001mm precision (more than sufficient)
+    for v in deduped_verts:
+        v[0] = round(v[0], 3)
+        v[1] = round(v[1], 3)
+        v[2] = round(v[2], 3)
+
     # Build IFC entities
     try:
         point_list = ifc.createIfcCartesianPointList3D(deduped_verts)
@@ -311,9 +318,9 @@ def _get_shared(ifc):
 
 
 def _make_placement(ifc, x: float, y: float, z: float):
-    """Create an IfcLocalPlacement at absolute world coordinates (metres)."""
+    """Create an IfcLocalPlacement at absolute world coordinates (mm)."""
     shared = _get_shared(ifc)
-    origin = ifc.createIfcCartesianPoint([x, y, z])
+    origin = ifc.createIfcCartesianPoint([round(x, 3), round(y, 3), round(z, 3)])
     a2p    = ifc.createIfcAxis2Placement3D(origin, shared["z_axis"], shared["x_axis"])
     return ifc.createIfcLocalPlacement(PlacementRelTo=None, RelativePlacement=a2p)
 

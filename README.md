@@ -1,8 +1,6 @@
 # Speckle → IFC 4.3 Exporter (Rhino)
 
-A [Speckle Automate](https://automate.speckle.dev/) function that converts Speckle models (from Rhino and other authoring tools) into IFC 4.3 files.
-
-🚫 **BLOCKER:** fIles that are bigger than 100MB are failing to upload because automate uses the /api/streams/:streamId/blobs endpoint (proxied through our server, which has a 100MB request size limit imposed by cloudflare) - we havea ticket to resolve this TBD.
+A [Speckle Automate](https://automate.speckle.dev/) function that converts Speckle models (from Rhino and other authoring tools) into IFC 4X3 files.
 
 ## How It Works
 
@@ -11,7 +9,19 @@ A [Speckle Automate](https://automate.speckle.dev/) function that converts Speck
 3. **Classifies** each element into its IFC type (e.g. `IfcColumn`, `IfcWall`) using the `Attributes.type` property.
 4. **Exports geometry** — meshes, instances (block definitions), and curves — into IFC representations.
 5. **Clones properties** — attributes, property sets, and quantities — from the Speckle object onto the IFC entity.
-6. **Writes** the resulting `.ifc` file.
+6. **Writes** the resulting `.ifc` file, compressed as a `.zip`.
+
+## Performance Optimizations
+
+The exporter is optimized for file size and speed:
+
+- **Geometry deduplication** — identical meshes are hashed (MD5 of vertex + face data) and shared via `IfcRepresentationMap` + `IfcMappedItem`, so instances reuse a single geometry copy.
+- **Shared property sets** — identical `IfcPropertySet` / `IfcElementQuantity` entities are created once and linked to all elements via batched `IfcRelDefinesByProperties`.
+- **Batched spatial containment** — `IfcRelContainedInSpatialStructure` and type assignments are written in bulk at the end, not per-element.
+- **Vertex deduplication & rounding** — near-coincident vertices are merged (0.01mm tolerance) and coordinates rounded to 3 decimal places.
+- **Direction & value caching** — `IfcDirection`, `IfcCartesianPoint`, and `IfcNominalValue` entities are reused across the file.
+- **Lazy material creation** — `IfcSurfaceStyle` entities are only created when actually assigned to geometry.
+- **ZIP compression** — output is compressed before upload.
 
 ## Supported Property Formats
 
@@ -45,6 +55,16 @@ properties:
 
 The exporter automatically detects the format and unflattens dot-notation keys into the nested structure before processing.
 
+## Instance Handling
+
+Speckle InstanceProxy objects (block instances) are exported using the IFC mapped representation pattern:
+
+- Each unique block definition becomes an `IfcRepresentationMap` (geometry stored once).
+- Each instance becomes an `IfcMappedItem` with an `IfcCartesianTransformationOperator3DnonUniform` encoding the full 4x4 transform (explicit Axis3 for correct orientation with mirrors and non-orthogonal transforms).
+- Content-based geometry hashing ensures that different definition IDs with identical geometry share the same `IfcRepresentationMap`.
+
+Supports both Revit-format instances (hex hash definitionId, mm units) and speckleifc-format instances (`DEFINITION:` prefix, metre units).
+
 ## Function Inputs
 
 | Input | Description |
@@ -62,19 +82,18 @@ utils/
   traversal.py          # Walks the Speckle Collection tree
   mapper.py             # Maps Speckle objects → IFC entity classes
   properties.py         # Extracts & writes attributes, property sets, quantities
-  geometry.py           # Mesh → IFC geometry conversion
-  instances.py          # Block instance / definition handling
-  curves.py             # Curve geometry (Polycurve, Line, Arc)
+  geometry.py           # Mesh → IFC geometry conversion (IfcPolygonalFaceSet)
+  instances.py          # Block instance / definition handling (RepMap + MappedItem)
+  curves.py             # Curve geometry (Polycurve, Line, Arc → IfcIndexedPolyCurve)
   writer.py             # IFC scaffold creation, storey management
   type_manager.py       # IfcTypeObject creation & assignment
-  materials.py          # Material mapping
+  materials.py          # Material colour mapping (IfcSurfaceStyle)
   helpers.py            # Shared utilities (_get, unit scales)
-  receiver.py           # Speckle server connection & data retrieval
 ```
 
 ## Getting Started
 
-## Using with Speckle Automate
+### Using with Speckle Automate
 
 1. Go to the Automations tab in your project
 2. Click New Automation

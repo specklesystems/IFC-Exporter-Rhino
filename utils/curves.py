@@ -38,10 +38,10 @@ def _resolve_scale(obj, fallback: float) -> float:
 
 
 def _point_coords(pt, scale: float) -> tuple:
-    """Extract (x, y, z) from a Speckle Point, scaled to mm."""
-    x = float(_get(pt, "x") or 0) * scale
-    y = float(_get(pt, "y") or 0) * scale
-    z = float(_get(pt, "z") or 0) * scale
+    """Extract (x, y, z) from a Speckle Point, scaled to mm and rounded."""
+    x = round(float(_get(pt, "x") or 0) * scale, 3)
+    y = round(float(_get(pt, "y") or 0) * scale, 3)
+    z = round(float(_get(pt, "z") or 0) * scale, 3)
     return x, y, z
 
 
@@ -112,9 +112,9 @@ def _extract_polycurve(obj, scale: float) -> tuple:
             values = list(raw_value) if not isinstance(raw_value, list) else raw_value
             indices = []
             for vi in range(0, len(values) - 2, 3):
-                x = float(values[vi]) * seg_scale
-                y = float(values[vi + 1]) * seg_scale
-                z = float(values[vi + 2]) * seg_scale
+                x = round(float(values[vi]) * seg_scale, 3)
+                y = round(float(values[vi + 1]) * seg_scale, 3)
+                z = round(float(values[vi + 2]) * seg_scale, 3)
                 key = (round(x * 100), round(y * 100), round(z * 100))
                 if key in point_map:
                     idx = point_map[key]

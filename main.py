@@ -1,3 +1,4 @@
+import zipfile
 from datetime import datetime
 
 import ifcopenshell.api
@@ -11,6 +12,7 @@ from utils.instances import (
 )
 from utils.properties import (
     get_building_storey, get_element_name, write_all_properties,
+    PropertySetManager,
 )
 from utils.curves import curve_to_ifc
 from utils.writer import create_ifc_scaffold, StoreyManager
@@ -89,6 +91,7 @@ def automate_function(
     material_manager = MaterialManager(ifc, base)
     material_manager.build_definition_material_map(definition_map)
     type_manager = TypeManager(ifc)
+    property_manager = PropertySetManager(ifc)
 
     # ------------------------------------------------------------------ #
     # 4. Traverse & export
@@ -138,7 +141,7 @@ def automate_function(
                 continue
             element = _create_element(ifc, ifc_class, name, rep, placement,
                                       storey, storey_manager=storey_manager)
-            write_all_properties(ifc, element, obj)
+            write_all_properties(ifc, element, obj, property_manager)
             type_manager.assign(element, obj, ifc_class)
             instance_count += 1
             total += 1
@@ -159,7 +162,7 @@ def automate_function(
             if rep:
                 element = _create_element(ifc, ifc_class, name, rep, placement,
                                           storey, storey_manager=storey_manager)
-                write_all_properties(ifc, element, obj)
+                write_all_properties(ifc, element, obj, property_manager)
                 type_manager.assign(element, obj, ifc_class)
                 total += 1
 
@@ -177,7 +180,7 @@ def automate_function(
                     ifc, ifc_class, name, inst_rep, inst_placement,
                     storey, storey_manager=storey_manager,
                 )
-                write_all_properties(ifc, inst_element, obj)
+                write_all_properties(ifc, inst_element, obj, property_manager)
                 type_manager.assign(inst_element, obj, ifc_class)
                 instance_count += 1
                 total += 1
@@ -191,7 +194,7 @@ def automate_function(
                 if rep:
                     element = _create_element(ifc, ifc_class, name, rep, placement,
                                               storey, storey_manager=storey_manager)
-                    write_all_properties(ifc, element, obj)
+                    write_all_properties(ifc, element, obj, property_manager)
                     type_manager.assign(element, obj, ifc_class)
                     total += 1
 
@@ -209,6 +212,8 @@ def automate_function(
     storey_manager.flush()
     print("Flushing type relationships...")
     type_manager.flush()
+    print("Flushing shared property sets...")
+    property_manager.flush()
 
     file_name = function_inputs.file_name
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -217,11 +222,17 @@ def automate_function(
 
     ifc.write(ifc_filename)
     print(f"\nIFC file written: {ifc_filename}")
+
+    zip_filename = f"{file_name}_{timestamp}.zip"
+    with zipfile.ZipFile(zip_filename, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.write(ifc_filename)
+    print(f"Zipped: {zip_filename}")
+
     try:
-        automate_context.mark_run_success("Success! You can download the IF file below.")
-        automate_context.store_file_result(f"./{ifc_filename}")
+        automate_context.mark_run_success("Success! You can download the IFC file below.")
+        automate_context.store_file_result(f"./{zip_filename}")
     except Exception as e:
-        print(f"  ⚠️  Could not upload file result (network issue?): {e}")
+        print(f"  Could not upload file result (network issue?): {e}")
         automate_context.mark_run_failed(f"Something went wrong when storing file result. Exception detail: {e}") 
 
     print(f"\n{'=' * 60}")
@@ -234,6 +245,7 @@ def automate_function(
     print(f"  Levels             : {', '.join(storey_manager.names)}")
     print_instance_stats()
     material_manager.print_stats()
+    property_manager.print_stats()
     print(f"{'=' * 60}\n")
 
 def _create_element(ifc, ifc_class, name, rep, placement, storey,
