@@ -1,6 +1,14 @@
 # Speckle → IFC 4.3 Exporter (Rhino)
 
-A [Speckle Automate](https://automate.speckle.dev/) function that converts Speckle models (from Rhino and other authoring tools) into IFC 4X3 files.
+## 🚧 Project Status: WIP
+Hey there! This project is still under active development, so expect changes, bugs, and incomplete features.
+If you have any questions or suggestions, don’t hesitate to reach out at: **nikos@speckle.systems**
+
+A [Speckle Automate](https://docs.speckle.systems/developers/automate/introduction) function that converts Speckle models from Rhino into IFC 4X3 files.
+
+> ⚠️ **Note on Model Uploads**
+>
+> Large models (greater than 200MB) may fail to upload due to current file size limitations. The team is actively working on resolving this issue.
 
 ## How It Works
 
