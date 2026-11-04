@@ -27,8 +27,10 @@ jobs:
         id: extract_schema
         run: |
           python main.py generate_schema ${HOME}/${{ env.FUNCTION_SCHEMA_FILE_NAME }}
+      # Held at 0.8.1: the 2026.6.0 publisher validates the input schema with a
+      # draft-07 Ajv and rejects the 2020-12 $schema that specklepy always stamps.
       - name: Speckle Automate Function - Build and Publish
-        uses: specklesystems/speckle-automate-github-composite-action@2026.6.0
+        uses: specklesystems/speckle-automate-github-composite-action@0.8.1
         with:
           speckle_automate_url: ${{ env.SPECKLE_AUTOMATE_URL || vars.SPECKLE_AUTOMATE_URL || 'https://automate.speckle.dev' }}
           speckle_token: ${{ secrets.SPECKLE_FUNCTION_TOKEN }}
