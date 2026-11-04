@@ -8,6 +8,7 @@ from pydantic import Field
 from speckle_automate import (
     AutomateBase,
     AutomationContext,
+    AutomationRunData,
     execute_automate_function,
 )
 from specklepy.logging.exceptions import SpeckleException
@@ -75,19 +76,16 @@ def automate_function(
     zip_path = write_zipped_ifc(ifc, function_inputs.file_name)
     try:
         blob_id = automate_context.store_file_result(zip_path)
+        url = file_result_url(automate_context.automation_run_data, blob_id)
     except Exception as e:
         automate_context.mark_run_failed(f"Could not store the IFC file: {e}")
         return
-    # The app's run details show no attachments (ENG-11525), so the status
-    # message carries the link.
-    url = file_result_url(automate_context.automation_run_data, blob_id)
-    print(f"Stored file result {zip_path.name}: {url}")
     automate_context.mark_run_success(
         f"Exported {stats.exported} elements. Download the result file: {url}"
     )
 
 
-def file_result_url(run_data, blob_id: str) -> str:
+def file_result_url(run_data: AutomationRunData, blob_id: str) -> str:
     """Browser download link for a file stored with store_file_result."""
     server = run_data.speckle_server_url.rstrip("/")
     return f"{server}/api/stream/{run_data.project_id}/blob/{blob_id}"

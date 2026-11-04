@@ -2,13 +2,13 @@
 
 import os
 import zipfile
-from types import SimpleNamespace
 
 import ifcopenshell
 import ifcopenshell.guid
 import ifcopenshell.util.element
 import ifcopenshell.validate
 import pytest
+from speckle_automate import AutomationRunData
 
 from main import FunctionInputs, automate_function, write_zipped_ifc
 from tests import fixture_bundle
@@ -199,8 +199,13 @@ class FakeContext:
         self._model = model
         self.files = []
         self.status = None
-        self.automation_run_data = SimpleNamespace(
-            speckle_server_url="https://app.speckle.systems/", project_id="proj123"
+        self.automation_run_data = AutomationRunData(
+            project_id="proj123",
+            speckle_server_url="https://app.speckle.systems",
+            automation_id="a",
+            automation_run_id="r",
+            function_run_id="f",
+            triggers=[],
         )
 
     def receive_version_bundle(self):
