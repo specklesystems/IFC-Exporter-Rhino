@@ -2,6 +2,7 @@
 
 import os
 import zipfile
+from types import SimpleNamespace
 
 import ifcopenshell
 import ifcopenshell.guid
@@ -198,13 +199,16 @@ class FakeContext:
         self._model = model
         self.files = []
         self.status = None
+        self.automation_run_data = SimpleNamespace(
+            speckle_server_url="https://app.speckle.systems/", project_id="proj123"
+        )
 
     def receive_version_bundle(self):
         return self._model
 
     def store_file_result(self, path):
         self.files.append(path)
-        return "blob"
+        return "blob42"
 
     def mark_run_success(self, message):
         self.status = ("success", message)
@@ -226,6 +230,9 @@ def test_automate_function_exports_and_stores_the_zip(model, tmp_path, monkeypat
         ),
     )
     assert context.status[0] == "success"
+    assert context.status[1].endswith(
+        "https://app.speckle.systems/api/stream/proj123/blob/blob42"
+    )
     [stored] = context.files
     assert stored.suffix == ".zip" and stored.exists()
     assert not os.path.exists(model.directory)  # the received bundle is cleaned up
