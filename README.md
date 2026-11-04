@@ -17,7 +17,7 @@ A [Speckle Automate](https://docs.speckle.systems/developers/automate/introducti
 3. **Classifies** each object into its IFC class (e.g. `IfcColumn`, `IfcWall`) from `Attributes.type`. A name that is not an instantiable IFC4X3 product falls back to `IfcBuildingElementProxy`.
 4. **Exports geometry**: direct meshes, placed definitions (block instances, nested ones included) and, when an object has no surfaces, curves.
 5. **Writes properties**: attributes, property sets, quantities and type objects from the object's properties.
-6. **Writes** the `.ifc` file, compressed as a `.zip`, and attaches it to the run.
+6. **Writes** the `.ifc` file, compressed as a `.zip`, attaches it to the run and ends the run's status message with the zip's download link.
 
 > ℹ️ The function reads **bundle versions only** (the speckle-next storage format). A version without a bundle fails the run with a message saying so.
 
@@ -80,7 +80,7 @@ Objects on a bundle level go into an `IfcBuildingStorey` of that name and elevat
 ## Project Structure
 
 ```
-main.py                 # Automate entry point: receive bundle, export, zip, attach
+main.py                 # Automate entry point: receive bundle, export, zip, attach + link
 utils/
   exporter.py           # The export loop over bundle objects
   bundle_geometry.py    # Resolves an object's direct and placed (instanced) geometry
