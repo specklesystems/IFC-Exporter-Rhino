@@ -1,191 +1,97 @@
-# =============================================================================
-# materials.py
-# Reads renderMaterialProxies from the Speckle root object and applies
-# IfcSurfaceStyle colours to IFC geometry.
-#
-# Structure of renderMaterialProxies:
-#   root.renderMaterialProxies = [
-#     {
-#       id: "636259b3..."
-#       value: RenderMaterial {
-#         name:    "Glass"
-#         diffuse: -16744256   ← ARGB packed int (A=255, R=0, G=128, B=192)
-#         opacity: 0.1         ← 0=transparent, 1=opaque
-#       }
-#       objects: ["a1a6b0c2-...", "d5dd3127-...", ...]  ← mesh applicationIds
-#     },
-#     ...
-#   ]
-#
-# Usage:
-#   mgr = MaterialManager(ifc, root)
-#   mgr.apply_to_item(brep_item, mesh_app_id)
-# =============================================================================
+"""Bundle MATERIAL / COLOR nodes → IfcSurfaceStyle, created on first use.
+
+Styles are only created when assigned to geometry, so the file never carries
+orphaned IfcSurfaceStyle instances (IFC105).
+"""
 
 import ifcopenshell
-import ifcopenshell.api
-from specklepy.objects.base import Base
-from utils.helpers import _get
+import ifcopenshell.api.style
+from specklepy.bundle.model import ModelGeometry
 
 
-def _argb_to_rgb(argb_int: int) -> tuple[float, float, float]:
-    """Unpack a signed ARGB int to normalised (R, G, B) floats 0..1."""
-    unsigned = argb_int & 0xFFFFFFFF
-    r = ((unsigned >> 16) & 0xFF) / 255.0
-    g = ((unsigned >> 8)  & 0xFF) / 255.0
-    b = (unsigned         & 0xFF) / 255.0
-    return r, g, b
+def _argb_channels(argb: int) -> tuple[float, float, float, float]:
+    """Unpack a (signed) packed ARGB int to normalised (A, R, G, B)."""
+    unsigned = argb & 0xFFFFFFFF
+    return (
+        ((unsigned >> 24) & 0xFF) / 255.0,
+        ((unsigned >> 16) & 0xFF) / 255.0,
+        ((unsigned >> 8) & 0xFF) / 255.0,
+        (unsigned & 0xFF) / 255.0,
+    )
 
 
 class MaterialManager:
-    """
-    Builds a lookup from mesh applicationId → IfcSurfaceStyle,
-    then applies styles to IFC geometry items.
-    """
-
-    def __init__(self, ifc: ifcopenshell.file, root: Base):
+    def __init__(self, ifc: ifcopenshell.file):
         self._ifc = ifc
-        # mesh applicationId (lowercase) → IfcSurfaceStyle (populated lazily)
-        self._style_map: dict[str, object] = {}
-        # name → IfcSurfaceStyle (cache to avoid duplicates)
-        self._style_cache: dict[str, object] = {}
-        self._apply_count = 0
-        self._miss_count = 0
-        self._build(root)
+        self._styles: dict[tuple[str, int], object] = {}
+        self.applied = 0
+        self.missed = 0
 
-    def _build(self, root: Base):
+    def style_for(self, geometry: ModelGeometry):
+        """Return the IfcSurfaceStyle for a geometry's resolved appearance, or None.
+
+        The bundle's render material wins; a display colour is the fallback.
         """
-        Parse renderMaterialProxies and store raw material data keyed by mesh applicationId.
-        IFC styles are created lazily (only when actually assigned to geometry) to avoid
-        orphaned IfcSurfaceStyle instances that would fail IFC105 validation.
-        """
-        proxies = _get(root, "renderMaterialProxies") or []
-        if not isinstance(proxies, list):
-            proxies = list(proxies) if proxies else []
+        material = geometry.effective_material
+        if material is not None:
+            key = ("material", material.k)
+            if key not in self._styles:
+                fields = material.fields
+                _, r, g, b = _argb_channels(fields.argb)
+                transparency = max(0.0, min(1.0, 1.0 - float(fields.opacity)))
+                self._styles[key] = self._create_style(
+                    fields.name or material.name or "Material", (r, g, b), transparency
+                )
+            return self._styles[key]
 
-        # mesh applicationId (lowercase) → (name, diffuse_argb, transparency)
-        self._material_data: dict[str, tuple] = {}
+        color = geometry.effective_color
+        if color is not None:
+            key = ("color", color.k)
+            if key not in self._styles:
+                a, r, g, b = _argb_channels(color.fields.argb)
+                # A zero alpha byte means an RGB-only colour, not a fully clear one.
+                transparency = 0.0 if a == 0 else 1.0 - a
+                self._styles[key] = self._create_style(
+                    f"Color #{color.fields.argb & 0xFFFFFF:06X}",
+                    (r, g, b),
+                    transparency,
+                )
+            return self._styles[key]
+        return None
 
-        for proxy in proxies:
-            material = _get(proxy, "value")
-            if material is None:
-                continue
-            name    = _get(material, "name") or "Unnamed"
-            diffuse = _get(material, "diffuse")
-            opacity = _get(material, "opacity")
-            if diffuse is None:
-                continue
-            opacity_val  = float(opacity) if opacity is not None else 1.0
-            transparency = max(0.0, min(1.0, 1.0 - opacity_val))
+    def apply(self, item, style) -> None:
+        """Assign a style to an IFC geometry item (no-op when style is None)."""
+        if style is None:
+            self.missed += 1
+            return
+        ifcopenshell.api.style.assign_item_style(self._ifc, item=item, style=style)
+        self.applied += 1
 
-            objects = _get(proxy, "objects") or []
-            for app_id in (objects if isinstance(objects, list) else []):
-                if app_id:
-                    self._material_data[str(app_id).lower()] = (name, int(diffuse), transparency)
-
-        print(f"   Materials: {len(self._material_data)} mesh mappings (styles created on demand)")
-
-    def _get_or_create_style(self, name: str, diffuse_argb: int, transparency: float):
-        """Return cached style or create a new IfcSurfaceStyle."""
-        cache_key = f"{name}|{diffuse_argb}|{transparency:.4f}"
-        if cache_key in self._style_cache:
-            return self._style_cache[cache_key]
-
-        r, g, b = _argb_to_rgb(diffuse_argb)
-        style = ifcopenshell.api.run("style.add_style", self._ifc, name=name)
-        ifcopenshell.api.run(
-            "style.add_surface_style",
+    def _create_style(self, name: str, rgb: tuple[float, float, float], transparency):
+        style = ifcopenshell.api.style.add_style(self._ifc, name=name)
+        ifcopenshell.api.style.add_surface_style(
             self._ifc,
             style=style,
             ifc_class="IfcSurfaceStyleRendering",
             attributes={
-                "SurfaceColour": {"Name": None, "Red": r, "Green": g, "Blue": b},
+                "SurfaceColour": {
+                    "Name": None,
+                    "Red": rgb[0],
+                    "Green": rgb[1],
+                    "Blue": rgb[2],
+                },
                 "Transparency": transparency,
                 "ReflectanceMethod": "NOTDEFINED",
             },
         )
-        self._style_cache[cache_key] = style
         return style
 
-    def get_style(self, mesh_app_id: str):
-        """Return the IfcSurfaceStyle for a mesh applicationId (created on demand), or None."""
-        key = str(mesh_app_id).lower()
-        # Return already-created style if cached
-        if key in self._style_map:
-            return self._style_map[key]
-        # Create style now only if this mesh has material data
-        data = self._material_data.get(key)
-        if data is None:
-            return None
-        name, diffuse, transparency = data
-        style = self._get_or_create_style(name, diffuse, transparency)
-        self._style_map[key] = style
-        return style
+    @property
+    def count(self) -> int:
+        return len(self._styles)
 
-    def get_style_with_fallbacks(self, primary_app_id: str = None,
-                                  fallback_app_ids: list = None,
-                                  definition_id: str = None):
-        """3-tier style lookup: primary → fallbacks → definition mapping."""
-        style = None
-        if primary_app_id:
-            style = self.get_style(primary_app_id)
-        if not style and fallback_app_ids:
-            for fid in fallback_app_ids:
-                style = self.get_style(fid)
-                if style:
-                    break
-        if not style and definition_id:
-            style = self.get_style_by_definition(definition_id)
-        return style
-
-    def apply_to_item(self, item, mesh_app_id: str):
-        """Assign the material style to a single IFC geometry item (e.g. IfcPolygonalFaceSet)."""
-        style = self.get_style(mesh_app_id)
-        if style is None:
-            self._miss_count += 1
-            return
-        try:
-            ifcopenshell.api.run(
-                "style.assign_item_style",
-                self._ifc,
-                item=item,
-                style=style,
-            )
-            self._apply_count += 1
-        except Exception as e:
-            pass  # Non-fatal — geometry still exports without colour
-
-    def build_definition_material_map(self, definition_map: dict):
-        """
-        Build a mapping from definitionId → material data by resolving which
-        InstanceProxy objects the material proxy references and finding their definitionId.
-        This handles the case where renderMaterialProxies.objects references inner
-        InstanceProxy applicationIds rather than the top-level element applicationIds.
-        """
-        by_app_id = definition_map.get("by_app_id", {})
-        self._definition_material: dict[str, tuple] = {}  # definitionId → (name, diffuse, transparency)
-
-        for app_id_key, mat_data in self._material_data.items():
-            obj = by_app_id.get(app_id_key)
-            if obj is None:
-                continue
-            def_id = _get(obj, "definitionId")
-            if def_id and isinstance(def_id, str):
-                self._definition_material[def_id.lower()] = mat_data
-
-        if self._definition_material:
-            print(f"   Material definitionId mappings: {len(self._definition_material)}")
-
-    def get_style_by_definition(self, definition_id: str):
-        """Return IfcSurfaceStyle for a definitionId (created on demand), or None."""
-        if not hasattr(self, '_definition_material'):
-            return None
-        key = str(definition_id).lower()
-        data = self._definition_material.get(key)
-        if data is None:
-            return None
-        name, diffuse, transparency = data
-        return self._get_or_create_style(name, diffuse, transparency)
-
-    def print_stats(self):
-        print(f"   Materials applied: {self._apply_count}, missed: {self._miss_count}")
+    def print_stats(self) -> None:
+        print(
+            f"  Styles             : {self.count} "
+            f"(applied {self.applied}, unstyled items {self.missed})"
+        )

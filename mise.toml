@@ -1,2 +1,25 @@
 [tools]
 python = '3.13'
+
+[env]
+_.python.venv = { path = ".venv", create = true }
+
+[tasks.install]
+description = "Install the function and its dev dependencies into .venv"
+run = "pip install .[dev]"
+
+[tasks.test]
+description = "Run the test suite (server integration test skips without credentials)"
+run = "pytest"
+
+[tasks.lint]
+description = "Lint and check formatting"
+run = ["ruff check .", "ruff format --check ."]
+
+[tasks.fmt]
+description = "Format and auto-fix lint"
+run = ["ruff format .", "ruff check --fix ."]
+
+[tasks.schema]
+description = "Write the function input schema to functionSchema.json"
+run = "python main.py generate_schema functionSchema.json"

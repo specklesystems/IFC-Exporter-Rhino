@@ -1,38 +1,19 @@
-# =============================================================================
-# helpers.py
-# Shared utilities used across the exporter modules.
-# =============================================================================
+"""Shared helpers used across the exporter modules."""
+
+from specklepy.objects.models.units import get_scale_factor_from_string
+
+# The IFC file is declared in millimetres; every length is scaled into it.
+IFC_LENGTH_UNIT = "mm"
 
 
-def _get(obj, key, default=None):
+def mm_scale(units: str | None, fallback: float = 1.0) -> float:
+    """Return the factor that converts a length in ``units`` to millimetres.
+
+    Unknown, empty or unitless (``"none"``) strings return ``fallback``.
     """
-    Safe access for specklepy Base objects, dicts, or any hybrid.
-    Tries attribute access first, then bracket access.
-    """
-    if obj is None:
-        return default
-    if isinstance(obj, dict):
-        return obj.get(key, default)
+    if not units or units.strip().lower() == "none":
+        return fallback
     try:
-        val = getattr(obj, key, None)
-        if val is not None:
-            return val
+        return get_scale_factor_from_string(units, IFC_LENGTH_UNIT)
     except Exception:
-        pass
-    try:
-        val = obj[key]
-        if val is not None:
-            return val
-    except Exception:
-        pass
-    return default
-
-
-# Scale factors → MILLIMETRES (IFC file is declared as mm)
-MM_SCALES = {
-    "mm": 1.0,    "millimeter": 1.0,    "millimeters": 1.0,
-    "cm": 10.0,   "centimeter": 10.0,   "centimeters": 10.0,
-    "m":  1000.0, "meter": 1000.0,      "meters": 1000.0,
-    "ft": 304.8,  "foot": 304.8,        "feet": 304.8,
-    "in": 25.4,   "inch": 25.4,         "inches": 25.4,
-}
+        return fallback

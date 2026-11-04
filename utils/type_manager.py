@@ -1,146 +1,91 @@
-# =============================================================================
-# type_manager.py
-# Creates and caches IfcTypeObjects from Element Type Attributes and links
-# element instances to them via IfcRelDefinesByType.
-#
-# Type info comes from _properties:
-#   Element Type Attributes   → type class, Name, GlobalId, Tag, PredefinedType
-#   Element Type Property Sets → psets written on the type object
-#
-# Type objects are SHARED — keyed by GlobalId or (type_class, Name).
-# =============================================================================
+"""Element Type Attributes / Property Sets → shared IfcTypeObjects.
+
+Types are keyed by GlobalId, else (type class, Name), and linked to their elements
+through IfcRelDefinesByType at flush time.
+"""
 
 import ifcopenshell
-import ifcopenshell.api
-from specklepy.objects.base import Base
-from utils.properties import get_properties, _to_dict, _make_ifc_value
+import ifcopenshell.api.pset
+import ifcopenshell.api.root
+import ifcopenshell.api.type
+
+from utils.mapper import resolve_class
+from utils.properties import ValueCache
 
 
 class TypeManager:
-    """
-    Creates IfcTypeObjects on demand and caches them.
-    Call assign(element, obj) for each exported element.
-    """
-
-    def __init__(self, ifc: ifcopenshell.file):
+    def __init__(self, ifc: ifcopenshell.file, values: ValueCache):
         self._ifc = ifc
-        self._cache: dict[str, object] = {}      # cache_key → IfcTypeObject
-        self._pending: dict[int, list] = {}       # type_obj.id() → [element, ...]
+        self._values = values
+        self._cache: dict[str, object] = {}
+        self._pending: dict[int, list] = {}
 
-    def assign(self, element, obj: Base, ifc_class: str = ""):
-        """Create or retrieve cached type object and queue the assignment."""
-        props = get_properties(obj)
-        type_attrs = _to_dict(props.get("Element Type Attributes"))
-        type_psets = _to_dict(props.get("Element Type Property Sets"))
-
+    def assign(self, element, props: dict, ifc_class: str) -> None:
+        type_attrs = props.get("Element Type Attributes")
+        type_psets = props.get("Element Type Property Sets")
+        type_attrs = type_attrs if isinstance(type_attrs, dict) else {}
+        type_psets = type_psets if isinstance(type_psets, dict) else {}
         if not type_attrs and not type_psets:
             return
 
-        # Determine type class and cache key
-        type_class = None
-        if type_attrs:
-            type_class = type_attrs.get("type")
-
-        if type_class:
-            # Format A: Element Type Attributes has explicit type info
+        declared = type_attrs.get("type")
+        if isinstance(declared, str) and declared.strip():
+            type_class = resolve_class(declared.strip(), "IfcTypeObject")
+            attrs, psets = type_attrs, type_psets
             global_id = type_attrs.get("GlobalId")
-            name = type_attrs.get("Name") or ""
-            cache_key = global_id if global_id else f"{type_class}:{name}"
-
-            if cache_key not in self._cache:
-                type_obj = self._create_type(type_class, type_attrs, type_psets)
-                self._cache[cache_key] = type_obj
+            key = global_id or f"{type_class}:{type_attrs.get('Name') or ''}"
         else:
-            # Format B: No explicit type class — derive from element IFC class
-            type_class = ifc_class + "Type" if ifc_class else None
-            if not type_class:
-                return
+            # No declared type class: derive it from the element, and treat the
+            # attribute section as further property sets.
+            type_class = resolve_class(f"{ifc_class}Type", "IfcTypeObject")
+            attrs = {}
+            psets = {**type_psets, **type_attrs}
+            key = f"{type_class}:{sorted(psets.items(), key=lambda kv: kv[0])!r}"
 
-            # Merge: if type_attrs has no 'type' key, it contains psets directly
-            merged_psets = type_psets.copy() if type_psets else {}
-            if type_attrs:
-                merged_psets.update(type_attrs)
+        if type_class is None:
+            return
+        if key not in self._cache:
+            self._cache[key] = self._create_type(type_class, attrs, psets)
+        self._pending.setdefault(self._cache[key].id(), []).append(element)
 
-            cache_key = f"{type_class}:{repr(sorted(merged_psets.items()))}"
-
-            if cache_key not in self._cache:
-                type_obj = self._create_type(type_class, {}, merged_psets)
-                self._cache[cache_key] = type_obj
-
-        type_obj = self._cache[cache_key]
-        type_id = type_obj.id()
-
-        if type_id not in self._pending:
-            self._pending[type_id] = []
-        self._pending[type_id].append(element)
-
-    def flush(self):
-        """Write all IfcRelDefinesByType relationships."""
+    def flush(self) -> None:
         for type_id, elements in self._pending.items():
-            type_obj = self._ifc.by_id(type_id)
-            ifcopenshell.api.run(
-                "type.assign_type", self._ifc,
+            ifcopenshell.api.type.assign_type(
+                self._ifc,
                 related_objects=elements,
-                relating_type=type_obj,
+                relating_type=self._ifc.by_id(type_id),
             )
         self._pending.clear()
-        print(f"   Type objects created: {len(self._cache)}")
 
-    def _create_type(self, type_class: str, type_attrs: dict, type_psets: dict):
-        """Instantiate the IfcTypeObject with attributes and property sets."""
-        ifc = self._ifc
-        name = type_attrs.get("Name") or ""
+    @property
+    def count(self) -> int:
+        return len(self._cache)
 
-        type_obj = ifcopenshell.api.run(
-            "root.create_entity", ifc,
-            ifc_class=type_class,
-            name=name,
+    def _create_type(self, type_class: str, attrs: dict, psets: dict):
+        type_obj = ifcopenshell.api.root.create_entity(
+            self._ifc, ifc_class=type_class, name=str(attrs.get("Name") or "")
         )
-
-        # Set standard attributes
-        for attr in ["GlobalId", "Tag", "Description", "ElementType"]:
-            val = type_attrs.get(attr)
-            if val is not None:
+        for attr in ("GlobalId", "Tag", "Description", "ElementType"):
+            value = attrs.get(attr)
+            if value is not None and hasattr(type_obj, attr):
                 try:
-                    setattr(type_obj, attr, str(val))
+                    setattr(type_obj, attr, str(value))
                 except Exception:
-                    pass
-
-        # PredefinedType (enum)
-        ptype = type_attrs.get("PredefinedType")
-        if ptype:
+                    print(f"  Warning: invalid {attr} {value!r} on {type_class}")
+        ptype = attrs.get("PredefinedType")
+        if ptype and hasattr(type_obj, "PredefinedType"):
             try:
                 type_obj.PredefinedType = str(ptype)
             except Exception:
-                pass
+                print(f"  Warning: invalid PredefinedType {ptype!r} on {type_class}")
 
-        # Write type-level property sets
-        if type_psets:
-            for pset_name, pset_data in type_psets.items():
-                pset_dict = _to_dict(pset_data) if not isinstance(pset_data, dict) else pset_data
-                if not pset_dict:
-                    continue
-                ifc_props = []
-                for prop_name, prop_value in pset_dict.items():
-                    if prop_name == "id" or prop_value is None:
-                        continue
-                    try:
-                        nominal = _make_ifc_value(ifc, prop_value)
-                        p = ifc.create_entity(
-                            "IfcPropertySingleValue",
-                            Name=str(prop_name),
-                            NominalValue=nominal,
-                        )
-                        ifc_props.append(p)
-                    except Exception:
-                        continue
-                if ifc_props:
-                    try:
-                        pset = ifcopenshell.api.run(
-                            "pset.add_pset", ifc, product=type_obj, name=pset_name
-                        )
-                        pset.HasProperties = ifc_props
-                    except Exception:
-                        pass
-
+        for pset_name, pset in psets.items():
+            if not isinstance(pset, dict):
+                continue
+            props = self._values.single_values(pset)
+            if props:
+                ifc_pset = ifcopenshell.api.pset.add_pset(
+                    self._ifc, product=type_obj, name=str(pset_name)
+                )
+                ifc_pset.HasProperties = props
         return type_obj

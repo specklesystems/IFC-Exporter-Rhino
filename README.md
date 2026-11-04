@@ -4,7 +4,7 @@
 Hey there! This project is still under active development, so expect changes, bugs, and incomplete features.
 If you have any questions or suggestions, don’t hesitate to reach out at: **nikos@speckle.systems**
 
-A [Speckle Automate](https://docs.speckle.systems/developers/automate/introduction) function that converts Speckle models from Rhino into IFC 4X3 files.
+A [Speckle Automate](https://docs.speckle.systems/developers/automate/introduction) function that converts Speckle models (built for Rhino, works on any bundle) into IFC4X3 files.
 
 > ⚠️ **Note on Model Uploads**
 >
@@ -12,66 +12,61 @@ A [Speckle Automate](https://docs.speckle.systems/developers/automate/introducti
 
 ## How It Works
 
-1. **Receives** a Speckle model version via Speckle Automate.
-2. **Traverses** the nested Collection tree to find all BIM elements.
-3. **Classifies** each element into its IFC type (e.g. `IfcColumn`, `IfcWall`) using the `Attributes.type` property.
-4. **Exports geometry** — meshes, instances (block definitions), and curves — into IFC representations.
-5. **Clones properties** — attributes, property sets, and quantities — from the Speckle object onto the IFC entity.
-6. **Writes** the resulting `.ifc` file, compressed as a `.zip`.
+1. **Receives** the triggering version as a Speckle bundle (`AutomationContext.receive_version_bundle`, specklepy 2026.9+).
+2. **Walks** every bundle object. Definition members are exported through the objects that place them, not on their own.
+3. **Classifies** each object into its IFC class (e.g. `IfcColumn`, `IfcWall`) from `Attributes.type`. A name that is not an instantiable IFC4X3 product falls back to `IfcBuildingElementProxy`.
+4. **Exports geometry**: direct meshes, placed definitions (block instances, nested ones included) and, when an object has no surfaces, curves.
+5. **Writes properties**: attributes, property sets, quantities and type objects from the object's properties.
+6. **Writes** the `.ifc` file, compressed as a `.zip`, and attaches it to the run.
+
+> ℹ️ The function reads **bundle versions only** (the speckle-next storage format). A version without a bundle fails the run with a message saying so.
 
 ## Performance Optimizations
 
-The exporter is optimized for file size and speed:
+- **Shared definition geometry**: each block definition becomes one `IfcRepresentationMap`, referenced by an `IfcMappedItem` per placement. The producer already deduplicates bundle geometry by content, so identical definitions share too.
+- **Shared property sets**: identical `IfcPropertySet` / `IfcElementQuantity` entities are created once and linked through batched `IfcRelDefinesByProperties`.
+- **Batched relationships**: spatial containment and type assignments are written in bulk at the end.
+- **Vertex deduplication and rounding**: near-coincident vertices are merged (0.01 mm), coordinates are rounded to 3 decimals, and degenerate faces are dropped (GEM111).
+- **Entity reuse**: `IfcDirection` and nominal values are cached and reused across the file.
+- **Lazy styles**: `IfcSurfaceStyle` entities are only created when assigned to geometry (no orphans, IFC105).
+- **ZIP compression** of the output.
 
-- **Geometry deduplication** — identical meshes are hashed (MD5 of vertex + face data) and shared via `IfcRepresentationMap` + `IfcMappedItem`, so instances reuse a single geometry copy.
-- **Shared property sets** — identical `IfcPropertySet` / `IfcElementQuantity` entities are created once and linked to all elements via batched `IfcRelDefinesByProperties`.
-- **Batched spatial containment** — `IfcRelContainedInSpatialStructure` and type assignments are written in bulk at the end, not per-element.
-- **Vertex deduplication & rounding** — near-coincident vertices are merged (0.01mm tolerance) and coordinates rounded to 3 decimal places.
-- **Direction & value caching** — `IfcDirection`, `IfcCartesianPoint`, and `IfcNominalValue` entities are reused across the file.
-- **Lazy material creation** — `IfcSurfaceStyle` entities are only created when actually assigned to geometry.
-- **ZIP compression** — output is compressed before upload.
+## Properties
 
-## Supported Property Formats
+Bundle properties are dotted paths, so Rhino user strings written flat and producers that nest arrive the same way:
 
-The exporter handles two property formats:
-
-### Nested (ArchiCAD / IFC-native)
-Properties are stored as nested dicts under `_properties`:
 ```
-_properties:
-  Attributes:
-    Name: "MyColumn"
-    type: "IfcColumn"
-  Property Sets:
-    Pset_ColumnCommon:
-      IsExternal: true
-  Quantities:
-    BaseQuantities:
-      Height: {name: "Height", units: "millimetre", value: 3000}
+Attributes.type: "IfcColumn"                   Attributes:
+Attributes.Name: "C1"                            type: "IfcColumn"
+Attributes.GlobalId: "yOTS1rnOhBKW4JIfec29TS"    Name: "C1"
+Property Sets.Pset_ColumnCommon.IsExternal       Property Sets:
+Quantities.BaseQuantities.Height.value             Pset_ColumnCommon: {IsExternal: true}
+Quantities.BaseQuantities.Height.units           Quantities:
+                                                   BaseQuantities:
+                                                     Height: {name: Height, units: millimetre, value: 3000}
 ```
 
-### Flat Dot-Notation (Rhino / Speckle)
-Properties are stored as flat key-value pairs with dot-separated paths under `properties`:
-```
-properties:
-  Attributes.Name: "600S162-43-50"
-  Attributes.type: "IfcColumn"
-  Attributes.GlobalId: "yOTS1rnOhBKW4JIfec29TS"
-  Quantities.BaseQuantities.Gross Weight.value: "15.452"
-  Quantities.BaseQuantities.Member Length.value: "118.938"
-```
+| Section | Becomes |
+|---|---|
+| `Attributes` | `GlobalId`, `Name`, `Tag`, `ObjectType`, `Description`, `PredefinedType`; `type` picks the IFC class |
+| `Property Sets` | one `IfcPropertySet` per set |
+| `Quantities` | one `IfcElementQuantity` per set; the quantity class comes from `units`, else from the name |
+| `Element Type Attributes` / `Element Type Property Sets` | a shared `IfcTypeObject` (`type` picks its class, e.g. `IfcColumnType`) |
+| `Building Storey` | the storey, when the object has no bundle level |
 
-The exporter automatically detects the format and unflattens dot-notation keys into the nested structure before processing.
+Type-level bundle properties are read underneath the object's own. Objects without `Attributes.GlobalId` get a GlobalId derived from their applicationId, so re-exporting a version keeps the same ids.
 
-## Instance Handling
+## Storeys
 
-Speckle InstanceProxy objects (block instances) are exported using the IFC mapped representation pattern:
+Objects on a bundle level go into an `IfcBuildingStorey` of that name and elevation. Otherwise the `Building Storey` property names the storey, and everything else lands in `Unknown Storey`.
 
-- Each unique block definition becomes an `IfcRepresentationMap` (geometry stored once).
-- Each instance becomes an `IfcMappedItem` with an `IfcCartesianTransformationOperator3DnonUniform` encoding the full 4x4 transform (explicit Axis3 for correct orientation with mirrors and non-orthogonal transforms).
-- Content-based geometry hashing ensures that different definition IDs with identical geometry share the same `IfcRepresentationMap`.
+## Geometry
 
-Supports both Revit-format instances (hex hash definitionId, mm units) and speckleifc-format instances (`DEFINITION:` prefix, metre units).
+- **Meshes** become one `IfcPolygonalFaceSet` each, so every mesh carries its own style. The element is placed at its bounding-box centre (X/Y) and minimum Z.
+- **Placed definitions** become `IfcMappedItem`s with an `IfcCartesianTransformationOperator3DnonUniform` carrying the composed 4x4 transform (explicit Axis3, so mirrored and non-orthogonal placements keep their orientation). A placed object with no IFC class of its own takes its definition member's.
+- **Curves** (line, arc, circle, polyline, polycurve, NURBS via its display polyline) become `IfcIndexedPolyCurve`s, used only when the object has no surface geometry.
+- **Materials**: the bundle render material (colour and opacity) becomes the `IfcSurfaceStyle`; a display colour is the fallback.
+- Every length is scaled to millimetres from the geometry's (or the model's) units. Raw host solids such as Rhino breps cannot be read here and are skipped; their display meshes are exported.
 
 ## Function Inputs
 
@@ -85,19 +80,31 @@ Supports both Revit-format instances (hex hash definitionId, mm units) and speck
 ## Project Structure
 
 ```
-main.py                 # Automate entry point — traversal, export loop, IFC writing
+main.py                 # Automate entry point: receive bundle, export, zip, attach
 utils/
-  traversal.py          # Walks the Speckle Collection tree
-  mapper.py             # Maps Speckle objects → IFC entity classes
-  properties.py         # Extracts & writes attributes, property sets, quantities
-  geometry.py           # Mesh → IFC geometry conversion (IfcPolygonalFaceSet)
-  instances.py          # Block instance / definition handling (RepMap + MappedItem)
-  curves.py             # Curve geometry (Polycurve, Line, Arc → IfcIndexedPolyCurve)
-  writer.py             # IFC scaffold creation, storey management
-  type_manager.py       # IfcTypeObject creation & assignment
-  materials.py          # Material colour mapping (IfcSurfaceStyle)
-  helpers.py            # Shared utilities (_get, unit scales)
+  exporter.py           # The export loop over bundle objects
+  bundle_geometry.py    # Resolves an object's direct and placed (instanced) geometry
+  geometry.py           # Meshes, mapped items and curves → IFC representations
+  instances.py          # Placement transforms → IFC transformation operators
+  curves.py             # Curves → IfcIndexedPolyCurve
+  mapper.py             # Attributes.type → IFC class (validated against IFC4X3)
+  properties.py         # Attributes, property sets, quantities, GlobalIds, storeys
+  type_manager.py       # IfcTypeObject creation and assignment
+  materials.py          # Bundle materials / colours → IfcSurfaceStyle
+  writer.py             # IFC scaffold and storey management
+  receiver.py           # Receive a version outside Automate (local debugging)
+  helpers.py            # Unit scaling
+tests/
+  fixture_bundle.py     # Builds a Rhino-shaped bundle locally
+  test_exporter.py      # Exports it and checks the IFC (schema-validated)
+  test_function.py      # End to end against a server (skipped without credentials)
 ```
+
+## Development
+
+With [mise](https://mise.jdx.dev): `mise run install`, then `mise run test`, `mise run lint` and `mise run fmt`. Without it: Python 3.13, `pip install .[dev]`, `pytest`.
+
+The exporter tests build a bundle with specklepy's `BundleBuilder` and need no server. To run the server integration test or `utils/receiver.py`, copy `.env.example` to `.env` and fill it in.
 
 ## Getting Started
 
@@ -112,6 +119,6 @@ utils/
 
 ## Resources
 
-- [SpecklePy SDK](https://speckle.guide/dev/python.html)
+- [SpecklePy SDK](https://github.com/specklesystems/specklepy)
 - [Speckle Automate](https://docs.speckle.systems/developers/automate/introduction)
 - [IFC 4.3 Documentation](https://standards.buildingsmart.org/IFC/RELEASE/IFC4_3/)

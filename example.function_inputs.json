@@ -1,12 +1,14 @@
 {
-  "speckleToken": "YOUR SPEKCLE TOKEN",
+  "speckleToken": "YOUR SPECKLE TOKEN",
   "functionInputs": {
-    "whisperMessage": "you are doing something weird",
-    "forbiddenSpeckleType": "wall"
+    "fileName": "export",
+    "ifcProjectName": "Speckle Export",
+    "ifcSiteName": "Site",
+    "ifcBuildingName": "Building"
   },
   "automationRunData": {
     "project_id": "project id",
-    "speckle_server_url": "https://latest.speckle.systems",
+    "speckle_server_url": "https://app.speckle.systems",
     "automation_id": "automation id",
     "automation_run_id": "automation run id",
     "function_run_id": "function run id",
